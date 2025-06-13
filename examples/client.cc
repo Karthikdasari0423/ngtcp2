@@ -1244,13 +1244,30 @@ int bind_addr(Address &local_addr, int fd, const in_addr_union *iau,
   addrinfo *res, *rp;
   char *node;
   std::array<char, NI_MAXHOST> nodebuf;
+  in_addr_union iau_storage;
 
-  if (iau) {
+  if (!config.client_ip.empty()) {
+    if (family == AF_INET) {
+      if (inet_pton(AF_INET, config.client_ip.c_str(), &iau_storage.in) != 1) {
+        std::cerr << "inet_pton: Could not parse client IP " << config.client_ip << std::endl;
+        return -1;
+      }
+    } else if (family == AF_INET6) {
+      if (inet_pton(AF_INET6, config.client_ip.c_str(), &iau_storage.in6) != 1) {
+        std::cerr << "inet_pton: Could not parse client IP " << config.client_ip << std::endl;
+        return -1;
+      }
+    } else {
+      // Should not happen with current supported families
+      return -1;
+    }
+    iau = &iau_storage;
+    node = const_cast<char *>(config.client_ip.c_str());
+  } else if (iau) {
     if (inet_ntop(family, iau, nodebuf.data(), nodebuf.size()) == nullptr) {
       std::cerr << "inet_ntop: " << strerror(errno) << std::endl;
       return -1;
     }
-
     node = nodebuf.data();
   } else {
     node = nullptr;
@@ -1290,6 +1307,35 @@ int bind_addr(Address &local_addr, int fd, const in_addr_union *iau,
 #ifndef HAVE_LINUX_RTNETLINK_H
 namespace {
 int connect_sock(Address &local_addr, int fd, const Address &remote_addr) {
+  if (!config.client_ip.empty()) {
+    addrinfo hints{
+        .ai_flags = AI_PASSIVE,
+        .ai_family = remote_addr.su.sa.sa_family,
+        .ai_socktype = SOCK_DGRAM,
+    };
+    addrinfo *res, *rp;
+
+    if (auto rv = getaddrinfo(config.client_ip.c_str(), "0", &hints, &res);
+        rv != 0) {
+      std::cerr << "getaddrinfo for local bind: " << gai_strerror(rv)
+                << std::endl;
+      return -1;
+    }
+
+    auto res_d = defer(freeaddrinfo, res);
+
+    for (rp = res; rp; rp = rp->ai_next) {
+      if (bind(fd, rp->ai_addr, rp->ai_addrlen) != -1) {
+        break;
+      }
+    }
+
+    if (!rp) {
+      std::cerr << "Could not bind to client IP " << config.client_ip << ": " << strerror(errno) << std::endl;
+      return -1;
+    }
+  }
+
   if (connect(fd, &remote_addr.su.sa, remote_addr.len) != 0) {
     std::cerr << "connect: " << strerror(errno) << std::endl;
     return -1;
@@ -2345,14 +2391,20 @@ int run(Client &c, const char *addr, const char *port,
 
 #ifdef HAVE_LINUX_RTNETLINK_H
   in_addr_union iau;
+  in_addr_union iau_auto;
+  in_addr_union *iau_ptr = nullptr;
 
-  if (get_local_addr(iau, remote_addr) != 0) {
-    std::cerr << "Could not get local address" << std::endl;
-    close(fd);
-    return -1;
+  if (config.client_ip.empty()) {
+    if (get_local_addr(iau_auto, remote_addr) != 0) {
+      std::cerr << "Could not get local address" << std::endl;
+      close(fd);
+      return -1;
+    }
+    iau_ptr = &iau_auto;
   }
+  // If config.client_ip is set, iau_ptr remains nullptr and bind_addr will handle it.
 
-  if (bind_addr(local_addr, fd, &iau, remote_addr.su.sa.sa_family) != 0) {
+  if (bind_addr(local_addr, fd, iau_ptr, remote_addr.su.sa.sa_family) != 0) {
     close(fd);
     return -1;
   }
@@ -2478,6 +2530,7 @@ void config_set_default(Config &config) {
     .handshake_timeout = UINT64_MAX,
     .ack_thresh = 2,
     .initial_pkt_num = UINT32_MAX,
+    .client_ip = "",
   };
 }
 } // namespace
@@ -2696,6 +2749,10 @@ Options:
   --ech-config-list-file=<PATH>
               Read ECHConfigList  from <PATH>.  ECH is  only attempted
               if an underlying TLS stack supports it.
+  --client-ip=<IP>
+              Specify the client IP address to use. If not specified,
+              the client IP address is automatically assigned by the
+              operating system.
   -h, --help  Display this help and exit.
 
 ---
@@ -2782,6 +2839,7 @@ int main(int argc, char **argv) {
       {"initial-pkt-num", required_argument, &flag, 42},
       {"pmtud-probes", required_argument, &flag, 43},
       {"ech-config-list-file", required_argument, &flag, 44},
+      {"client-ip", required_argument, &flag, 45},
       {},
     };
 
@@ -3228,6 +3286,10 @@ int main(int argc, char **argv) {
       case 44:
         // --ech-config-list-file
         ech_config_list_file = optarg;
+        break;
+      case 45:
+        // --client-ip
+        config.client_ip = optarg;
         break;
       }
       break;
